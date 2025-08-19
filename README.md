@@ -12,7 +12,7 @@ The paper studies how **stellar radiation pressure and gravity influence atomic 
 
 Lehtmets, A., Kama, M., Fossati, L., & Aret, A. (2025).  
 *Investigating Circumstellar Atomic Radiation-driven Dynamics.*  
-Accepted 2025, DOI: _to be added_.
+In revision 2025, DOI: _to be added_.
 
 ---
 
