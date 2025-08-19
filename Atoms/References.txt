@@ -1,0 +1,5 @@
+@Misc{nist,
+    author = {Kramida, A., Ralchenko, Yu., Reader, J. and NIST ASD Team},
+    howpublished = {{NIST Atomic Spectra Database (ver. 5.12), [Online]. Available: {\tt{https://physics.nist.gov/asd}} [Aug 18 2025]. National Institute of Standards and Technology, Gaithersburg, MD.}}, 
+    year = {2025}
+}
