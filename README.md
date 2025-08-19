@@ -4,9 +4,7 @@ This repository contains the code and supporting material for the article
 **“Investigating Circumstellar Atomic Radiation-driven Dynamics”**  
 by *Lehtmets, A., Kama, M., Fossati, L., & Aret, A.* (2025).
 
-The paper studies how **stellar radiation pressure and gravity influence atomic species** in circumstellar environments.  
-We calculate the radiation-to-gravitational force ratio (𝛽), evaluate the velocity boost of neutral atoms before ionisation,  
-and explore implications for **stellar photospheric contamination** by gas from **debris discs, evaporating hot Jupiters, and rocky planets**.
+The paper studies how **stellar radiation pressure and gravity influence atomic species** in circumstellar environments. We calculate the radiation-to-gravitational force ratio (𝛽), evaluate the velocity boost of neutral atoms before ionisation, and explore implications for **stellar photospheric contamination** by gas from **debris discs, evaporating hot Jupiters, and rocky planets**.
 
 ---
 
