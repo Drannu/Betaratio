@@ -1,0 +1,6 @@
+@misc{atlas,
+       author = {{Kurucz}, Robert L.},
+        title = "{ATLAS9: Model atmosphere program with opacity distribution functions}",
+ howpublished = {Astrophysics Source Code Library, record ascl:1710.017},
+         year = 2017,
+}
