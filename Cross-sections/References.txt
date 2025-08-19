@@ -1,0 +1,6 @@
+@misc{xcom,
+  author = {Martin Berger and J Hubbell and Stephen Seltzer and J Coursey and D Zucker},
+  title = {XCOM: Photon Cross Section Database (version 1.2)},
+  year = {2010},
+  publisher = {http://physics.nist.gov/xcom},
+}
