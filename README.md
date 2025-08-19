@@ -37,7 +37,7 @@ Betaratio/
 ### Prerequisites
 - Python ≥ 3.8
 - Jupyter Notebook
-- Required libraries: `numpy`, `matplotlib`, `scipy`, `pandas`
+- Required libraries: `numpy`, `matplotlib`, `scipy`, `pandas`, `json`, `os`, `scipy`, `math`
 
 ### Installation
 ```bash
@@ -61,6 +61,7 @@ jupyter notebook Main_notebook.ipynb
   - Gas-rich debris discs (e.g. β Pictoris, 49 Ceti)  
   - Evaporating hot Jupiters (e.g. HD 209458 b, KELT-9 b)  
   - Rocky planets (e.g. Kepler-1520 b)
+  - And much more (e. g. comet tail, ISM, ...)
 
 ---
 
