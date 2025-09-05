@@ -1,302 +1,175 @@
-
+# Robust IDL -> Python port for rotational/macroturbulent/instrumental broadening
 import numpy as np
-from typing import Tuple, Optional, overload, Literal
-import numpy.typing as npt
+from math import erf
 
-C_KMS = 299792.458  # km/s
+C_KMS = 299792.5
+SQRT_PI = np.sqrt(np.pi)
+LN2 = np.log(2.0)
+FWHM_TO_SIG = 1.0 / (2.0 * np.sqrt(LN2))   # sigma = FWHM / (2*sqrt(ln2))
 
-# -----------------------------
-# Utility kernels (velocity space)
-# -----------------------------
+def _is_equidistant(x, tol_factor=1e-6, max_resol=500000.0):
+    x = np.asarray(x, dtype=float)
+    if x.size < 3:
+        return True
+    dx = np.diff(x)
+    dx_min, dx_max = np.min(dx), np.max(dx)
+    meanw = 0.5 * (x[0] + x[-1])
+    eps = abs(meanw) / max_resol
+    return (dx_max - dx_min) <= max(eps, tol_factor * abs(np.median(dx)))
 
-def _gaussian_kernel_velocity(dv_kms: npt.NDArray[np.floating], fwhm_kms: float) -> npt.NDArray[np.floating]:
-    if fwhm_kms is None or fwhm_kms <= 0:
-        k = np.zeros(1, dtype=float)
-        k[0] = 1.0
-        return k
-    sigma = float(fwhm_kms) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    g = np.exp(-0.5 * (dv_kms / sigma) ** 2)
-    # normalise to unit area in dv
-    area = np.trapz(g, dv_kms)
-    if area > 0:
-        g /= area
-    return g
+def _make_uniform_grid(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if _is_equidistant(x):
+        return x.copy(), y.copy(), float(np.median(np.diff(x)))
+    step = float(np.median(np.diff(x)))
+    n = int(np.round((x[-1] - x[0]) / step)) + 1
+    xx = x[0] + step * np.arange(n, dtype=float)
+    yy = np.interp(xx, x, y)
+    return xx, yy, step
 
-def _rotational_kernel_gray(dv_kms: npt.NDArray[np.floating], vsini_kms: float, epsilon: float = 0.6) -> npt.NDArray[np.floating]:
-    """Gray rotational broadening with linear limb darkening epsilon."""
-    if vsini_kms is None or vsini_kms <= 0:
-        k = np.zeros(1, dtype=float); k[0] = 1.0
-        return k
-    x = np.clip(dv_kms / float(vsini_kms), -1.0, 1.0)
-    k = np.zeros_like(dv_kms, dtype=float)
-    mask = np.abs(x) < 1.0 + 1e-12
-    xin = x[mask]
-    # Gray 2005 eqn for linear LD
-    k[mask] = (2*(1-epsilon)*np.sqrt(1-xin**2) + (np.pi*epsilon/2.0)*(1-xin**2))
-    area = np.trapz(k, dv_kms)
-    if area > 0:
-        k /= area
-    return k
-
-def _rt_kernel_gray(dv_kms: npt.NDArray[np.floating],
-                    vmacro_fwhm_kms: float,
-                    epsilon: float = 0.6,
-                    frac_radial: float = 0.5,
-                    n_mu: int = 40,
-                    n_phi: int = 40) -> npt.NDArray[np.floating]:
-    """Gray radial–tangential macroturbulence kernel via numerical μ,φ integration.
-
-    We interpret `vmacro_fwhm_kms` as the *1D FWHM* of the Gaussian velocity field (ζ_RT).
-    Radial component LOS sigma = ζ * μ; tangential LOS sigma = ζ * sqrt(1-μ^2) * |cosφ|.
-    Limb darkening: I(μ) = 1 - ε + ε μ; surface element weight ∝ I(μ) μ dμ dφ.
-    Radial/tangential mixture is set by `frac_radial` (default 0.5/0.5).
+def _linear_convolve_same(y, k):
+    """Linear convolution via FFT, centre-aligned 'same' length.
+    Pads y and k to common length L = n + m - 1.
+    If kernel area ~ 0 (unresolvable), returns y unchanged.
     """
-    if vmacro_fwhm_kms is None or vmacro_fwhm_kms <= 0:
-        k = np.zeros(1, dtype=float); k[0] = 1.0
-        return k
-
-    zeta_sigma = float(vmacro_fwhm_kms) / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # km/s
-
-    # Integration grids
-    mu = np.linspace(0.0, 1.0, n_mu)
-    # Avoid exact zeros to prevent sigma=0
-    mu[0] = 1e-6
-    phi = np.linspace(0.0, 2*np.pi, n_phi, endpoint=False)
-
-    # limb darkening weight * projected area
-    I_mu = (1.0 - epsilon) + epsilon * mu
-    w_mu = I_mu * mu
-    w_mu /= np.trapz(w_mu, mu)  # normalise μ-weights
-
-    k = np.zeros_like(dv_kms, dtype=float)
-    for i, mui in enumerate(mu):
-        w_i = w_mu[i]
-        # --- radial part ---
-        sig_r = zeta_sigma * mui
-        if sig_r < 1e-8:
-            # delta-function contribution
-            kr = np.zeros_like(dv_kms); kr[np.argmin(np.abs(dv_kms))] = 1.0
-        else:
-            kr = np.exp(-0.5 * (dv_kms / sig_r) ** 2) / (np.sqrt(2*np.pi) * sig_r)
-
-        # --- tangential part --- (average over phi)
-        kt = np.zeros_like(dv_kms)
-        for ph in phi:
-            sig_t = zeta_sigma * np.sqrt(max(0.0, 1.0 - mui**2)) * abs(np.cos(ph))
-            if sig_t < 1e-8:
-                kt_phi = np.zeros_like(dv_kms); kt_phi[np.argmin(np.abs(dv_kms))] = 1.0
-            else:
-                kt_phi = np.exp(-0.5 * (dv_kms / sig_t) ** 2) / (np.sqrt(2*np.pi) * sig_t)
-            kt += kt_phi
-        kt /= len(phi)
-
-        k += w_i * (frac_radial * kr + (1.0 - frac_radial) * kt)
-
-    # Normalise kernel
-    area = np.trapz(k, dv_kms)
-    if area > 0:
-        k /= area
-    return k
-
-def _safe_convolve_same(y: npt.NDArray[np.floating], k: npt.NDArray[np.floating]) -> npt.NDArray[np.floating]:
-    k = np.asarray(k, float)
-    if k.ndim != 1:
-        k = k.ravel()
+    y = np.asarray(y, dtype=float)
+    k = np.asarray(k, dtype=float)
+    if y.ndim != 1 or k.ndim != 1:
+        raise ValueError("y and k must be 1D arrays")
     s = k.sum()
-    if s != 0:
-        k = k / s
-    return np.convolve(y, k, mode='same')
+    if (not np.isfinite(s)) or (abs(s) < 1e-14):
+        return y.copy()
+    k = k / s
+    n, m = y.size, k.size
+    L = n + m - 1
+    ypad = np.pad(y, (0, L - n), mode='constant')
+    kpad = np.pad(k, (0, L - m), mode='constant')
+    Y = np.fft.rfft(ypad)
+    K = np.fft.rfft(kpad)
+    full = np.fft.irfft(Y * K, n=L)
+    start = (m - 1) // 2
+    end = start + n
+    out = full[start:end]
+    if out.size != n:
+        out = np.convolve(y, k, mode='same')
+    return out
 
-def _chunk_edges(x: npt.NDArray[np.floating], step_angstrom: float) -> npt.NDArray[np.int_]:
-    edges = [0]
-    x0 = float(x[0])
-    for i in range(1, len(x)):
-        if x[i] - x0 >= step_angstrom:
-            edges.append(i)
-            x0 = float(x[i])
-    edges.append(len(x))
-    return np.unique(np.asarray(edges, dtype=int))
+def _rotational_kernel(px, lambda0, vrot, beta=1.5):
+    if vrot is None or vrot < 0.0:
+        return None, 0.0
+    dlam_max = vrot * (lambda0 / C_KMS)
+    if dlam_max <= 0:
+        return None, dlam_max
+    x = px / dlam_max
+    # Only non-zero for |x|<1
+    mask = np.abs(x) < 1.0
+    if not np.any(mask):
+        return np.zeros_like(px), dlam_max
+    x2 = x[mask] * x[mask]
+    num = (2.0 * np.sqrt(1.0 - x2) / np.pi) + ((1.0 - x2) * beta / 2.0)
+    den = (1.0 + 2.0 * beta / 3.0)
+    prof = np.zeros_like(px, dtype=float)
+    prof[mask] = (num / den) / dlam_max
+    return prof, dlam_max
 
-# -----------------------------
-# Main function
-# -----------------------------
+def _rt_macroturbulence_kernel(px, lambda0, vmacro):
+    if vmacro is None or vmacro <= 0:
+        return None, 0.0
+    MR = vmacro * (lambda0 / C_KMS)
+    if MR <= 0:
+        return None, MR
+    pxmr = np.abs(px) / MR
+    prof = (2.0 / (SQRT_PI * MR)) * (np.exp(-pxmr**2) + SQRT_PI * pxmr * (np.vectorize(erf)(pxmr) - 1.0))
+    prof = np.maximum(prof, 0.0)
+    return prof, MR
 
-@overload
-def convol_by_steps(
-    wavelength_input: npt.NDArray[np.floating],
-    flux_input: npt.NDArray[np.floating],
-    *,
-    vsini: Optional[float] = ...,
-    resol: Optional[float] = ...,
-    vdop: Optional[float] = ...,
-    ainst: Optional[float] = ...,
-    vmacro: Optional[float] = ...,
-    limb_darkening: float = ...,
-    rt_frac_radial: float = ...,
-    step_angstrom: float = ...,
-    return_kernel: Literal[True]
-) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]: ...
+def _gaussian_kernel(px, lambda0, vdop=None, ain=None, resol=None):
+    if (vdop is None) and (ain is None) and (resol is None):
+        return None, 0.0
+    if ain is not None:
+        dlam_sigma = float(ain) * FWHM_TO_SIG
+    elif resol is not None:
+        # sigma_v = c / (R * 2*sqrt(ln2))
+        sigma_v = C_KMS * FWHM_TO_SIG / float(resol)
+        dlam_sigma = sigma_v * (lambda0 / C_KMS)
+    else:
+        dlam_sigma = float(vdop) * (lambda0 / C_KMS)
+    if dlam_sigma <= 0:
+        return None, dlam_sigma
+    xx = px / dlam_sigma
+    prof = np.exp(-(xx**2)) / (np.sqrt(np.pi) * dlam_sigma)
+    # truncate far wings
+    prof[np.abs(xx) >= 6.0] = 0.0
+    return prof, dlam_sigma
 
-@overload
-def convol_by_steps(
-    wavelength_input: npt.NDArray[np.floating],
-    flux_input: npt.NDArray[np.floating],
-    *,
-    vsini: Optional[float] = ...,
-    resol: Optional[float] = ...,
-    vdop: Optional[float] = ...,
-    ainst: Optional[float] = ...,
-    vmacro: Optional[float] = ...,
-    limb_darkening: float = ...,
-    rt_frac_radial: float = ...,
-    step_angstrom: float = ...,
-    return_kernel: Literal[False] = ...
-) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]: ...
+def convol_ber(sx, sy, resol=None, vsini=None, beta=1.5, vmacro=None,
+               vdop=None, ain=None, message=False, original=False):
+    sx = np.asarray(sx, dtype=float)
+    sy = np.asarray(sy, dtype=float)
+    order = np.argsort(sx)
+    sx, sy = sx[order], sy[order]
+    sxx, syy, rdst = _make_uniform_grid(sx, sy)
+    nn = sxx.size
+    lambda0 = 0.5 * (sxx[0] + sxx[-1])
+    px = (np.arange(nn) - (nn // 2)) * rdst
 
-def convol_by_steps(
-    wavelength_input: npt.NDArray[np.floating],
-    flux_input: npt.NDArray[np.floating],
-    *,
-    vsini: Optional[float] = None,
-    resol: Optional[float] = None,
-    vdop: Optional[float] = None,
-    ainst: Optional[float] = None,
-    vmacro: Optional[float] = None,
-    limb_darkening: float = 0.6,
-    rt_frac_radial: float = 0.5,
-    step_angstrom: float = 100.0,
-    return_kernel: bool = False
-):
-    """Convolve a spectrum in ~step_angstrom windows with chosen broadening.
+    # Threshold: skip kernels narrower than ~0.3 pixel sigma / half-width
+    # This avoids zero-sum discrete kernels.
+    MIN_WIDTH = 0.3 * rdst
 
-    Mutually exclusive choices for the non-rotational term (choose one): `resol`, `vdop`, `ainst`, `vmacro`.
-    `vsini` rotational broadening is always applied (if >0) and effectively first.
-    Units: Å for wavelengths, km/s for velocities and FWHM.
-    """
+    # 1) Rotational
+    if vsini is not None and vsini > 0:
+        rot_k, dlam_max = _rotational_kernel(px, lambda0, vsini, beta=beta)
+        if (rot_k is not None) and (dlam_max >= MIN_WIDTH) and np.any(rot_k):
+            syy = _linear_convolve_same(syy, rot_k)
+
+    # 2) Macroturbulence
+    if vmacro is not None and vmacro > 0:
+        macro_k, MR = _rt_macroturbulence_kernel(px, lambda0, vmacro)
+        if (macro_k is not None) and (MR >= MIN_WIDTH) and np.any(macro_k):
+            syy = _linear_convolve_same(syy, macro_k)
+
+    # 3) Gaussian / Instrumental
+    gauss_k, dlam_sigma = _gaussian_kernel(px, lambda0, vdop=vdop, ain=ain, resol=resol)
+    if (gauss_k is not None) and (dlam_sigma >= MIN_WIDTH) and np.any(gauss_k):
+        syy = _linear_convolve_same(syy, gauss_k)
+
+    if original:
+        cy = np.interp(sx, sxx, syy)
+        cx = sx
+    else:
+        cx, cy = sxx, syy
+    return cx, cy
+
+def convol_by_steps(wavelength_input, flux_input, resol=None, vsini=None, vmacro=None,
+                    step=100.0, pad=10.0, beta=1.5, original=False):
     x = np.asarray(wavelength_input, dtype=float)
     y = np.asarray(flux_input, dtype=float)
-    if x.ndim != 1 or y.ndim != 1 or len(x) != len(y):
-        raise ValueError("wavelength_input and flux_input must be 1D arrays of equal length")
+    order = np.argsort(x)
+    x, y = x[order], y[order]
 
-    # Enforce mutual exclusivity
-    picks = sum(int(v is not None and v > 0) for v in (resol, vdop, ainst, vmacro))
-    if picks > 1:
-        raise ValueError("Choose exactly one of: resol, vdop, ainst, vmacro")
+    x_min, x_max = float(np.min(x)), float(np.max(x))
+    n_chunks = max(1, int(np.ceil(abs(x_max - x_min) / float(step))))
 
-    # Ensure increasing order
-    if x[0] > x[-1]:
-        x = x[::-1].copy()
-        y = y[::-1].copy()
-
-    f_out = np.zeros_like(y)
-    edges = _chunk_edges(x, step_angstrom=step_angstrom)
-
-    last_dv = None
-    last_k = None
-
-    for i in range(len(edges) - 1):
-        i0, i1 = int(edges[i]), int(edges[i+1])
-        if i1 - i0 < 5:
-            f_out[i0:i1] = y[i0:i1]
+    x_out, y_out = [], []
+    for j in range(n_chunks):
+        left = x_min + step * j - pad
+        right = x_min + step * (j + 1) + pad
+        sel = (x >= left) & (x < right)
+        if not np.any(sel):
             continue
+        cx, cy = convol_ber(x[sel], y[sel], resol=resol, vsini=vsini, beta=beta, vmacro=vmacro, original=original)
+        keep_left = x_min + step * j
+        keep_right = x_min + step * (j + 1)
+        keep = (cx >= keep_left) & (cx < keep_right)
+        if not np.any(keep):
+            continue
+        x_out.append(cx[keep])
+        y_out.append(cy[keep])
 
-        x_chunk = x[i0:i1]
-        y_chunk = y[i0:i1]
+    if not x_out:
+        cx, cy = convol_ber(x, y, resol=resol, vsini=vsini, beta=beta, vmacro=vmacro, original=original)
+        return cx, cy
 
-        dl = np.median(np.diff(x_chunk))
-        lam0 = 0.5 * (x_chunk[0] + x_chunk[-1])
-        dv_sample = (dl / lam0) * C_KMS
-
-        # Determine the broadening FWHM in velocity if Gaussian options are used
-        fwhm_gauss_v = None
-        if vdop and vdop > 0:
-            fwhm_gauss_v = float(vdop)
-        elif resol and resol > 0:
-            fwhm_gauss_v = C_KMS / float(resol)
-        elif ainst and ainst > 0:
-            fwhm_gauss_v = C_KMS * (float(ainst) / lam0)
-
-        # Build a dv grid wide enough to cover all kernels
-        vmaxs = []
-        if vsini and vsini > 0: vmaxs.append(float(vsini))
-        if fwhm_gauss_v:  # Gaussian-based
-            sigma = fwhm_gauss_v / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-            vmaxs.append(5.0 * sigma)
-        if vmacro and vmacro > 0:  # RT has wings comparable to Gaussian scale
-            sigma_rt = float(vmacro) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-            vmaxs.append(5.0 * sigma_rt)
-        vmax = max(vmaxs) if vmaxs else 0.0
-        vmax = max(vmax, 3.0 * dv_sample)
-        nvel = int(np.ceil(2 * vmax / dv_sample)) | 1
-        dv_kms = np.linspace(-vmax, vmax, nvel)
-
-        # Compose kernel in velocity space
-        k_total = np.zeros_like(dv_kms)
-        k_total[np.argmin(np.abs(dv_kms))] = 1.0  # delta
-
-        # Rotational first (conceptually)
-        k_rot = _rotational_kernel_gray(dv_kms, vsini or 0.0, epsilon=limb_darkening)
-        if len(k_rot) > 1:
-            k_total = _safe_convolve_same(k_total, k_rot)
-
-        # Then the mutually-exclusive choice
-        if fwhm_gauss_v:
-            k_gauss = _gaussian_kernel_velocity(dv_kms, fwhm_kms=fwhm_gauss_v)
-            k_total = _safe_convolve_same(k_total, k_gauss)
-        elif vmacro and vmacro > 0:
-            k_rt = _rt_kernel_gray(dv_kms, vmacro_fwhm_kms=float(vmacro),
-                                   epsilon=limb_darkening, frac_radial=rt_frac_radial)
-            k_total = _safe_convolve_same(k_total, k_rt)
-
-        # Normalize just in case
-        area = np.trapz(k_total, dv_kms)
-        if area > 0:
-            k_total /= area
-
-        # Map velocity kernel to wavelength grid at lam0
-        dlam = (dv_kms / C_KMS) * lam0
-        lam_kernel = lam0 + dlam
-        k_pix = np.interp(x_chunk, lam_kernel, k_total, left=0.0, right=0.0)
-        s = np.trapz(k_pix, x_chunk)
-        if s > 0:
-            k_pix /= s
-
-        f_conv = _safe_convolve_same(y_chunk, k_pix)
-        f_out[i0:i1] = f_conv
-
-        last_dv = dv_kms
-        last_k = k_total
-
-    if return_kernel:
-        return x, f_out, last_dv, last_k
-    return x, f_out
-
-# -----------------------------
-# Demo
-# -----------------------------
-def _demo():
-    import matplotlib.pyplot as plt
-    # Simple synthetic spectrum with a few lines
-    def make_spec(l0=5000.0, l1=5200.0, n=6000):
-        lam = np.linspace(l0, l1, n)
-        flux = np.ones_like(lam)
-        for centre, depth, fwhm in [(5060.0, 0.6, 0.3), (5110.0, 0.7, 0.2), (5180.0, 0.5, 0.25)]:
-            sigma = fwhm / (2*np.sqrt(2*np.log(2)))
-            flux *= (1 - depth*np.exp(-0.5*((lam-centre)/sigma)**2))
-        return lam, flux
-
-    w, f = make_spec()
-    w_out, f_out = convol_by_steps(w, f, vsini=20.0, resol=60000.0)
-
-    plt.figure(figsize=(9,3.5))
-    plt.plot(w, f, label="Original")
-    plt.plot(w_out, f_out, label="Broadened")
-    plt.xlabel("Wavelength [Å]")
-    plt.ylabel("Flux [arb]")
-    plt.title("Convolution by steps (Python) — fixed normalisation")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    _demo()
+    return np.concatenate(x_out), np.concatenate(y_out)
